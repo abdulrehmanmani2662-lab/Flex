@@ -1,4 +1,5 @@
 flask
 pillow
-rembg
+numpy
 onnxruntime
+requests
