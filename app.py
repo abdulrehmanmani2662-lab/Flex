@@ -15,31 +15,77 @@ import gc
 import io
 import os
 import sys
+import tempfile
 import traceback
 import zipfile
 
+import numpy as np
+import onnxruntime as ort
+import requests
 from flask import Flask, request, render_template_string, send_file
 from PIL import Image, ImageFilter, ImageDraw
 
-from rembg import new_session, remove
-
 app = Flask(__name__)
 
-# u2netp is the "lite" rembg model (~4MB vs ~170MB for the default u2net) —
-# uses far less RAM, which matters on free-tier hosting (512MB limit).
-# Loaded lazily (on first request, not at import time) so that if model
-# download/load fails, we get a clear error in the response instead of
-# the whole app crashing silently before it can even start serving.
-_session = None
+# --- Lightweight background removal (no rembg) -----------------------------
+# rembg pulls in scipy, numba, scikit-image, pymatting, networkx etc — that
+# whole stack alone can eat most of a 512MB free-tier RAM limit before a
+# single photo is even processed. Here we talk to the same u2netp ONNX model
+# directly through onnxruntime, skipping all of that, which uses far less
+# memory. Loaded lazily (first request, not import time) so a download/load
+# failure shows up as a normal error instead of crashing the whole app.
+MODEL_URL = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+MODEL_PATH = os.path.join(tempfile.gettempdir(), "u2netp.onnx")
+
+_ort_session = None
 
 
-def get_session():
-    global _session
-    if _session is None:
-        print("[startup] loading rembg session (u2netp)...", file=sys.stderr, flush=True)
-        _session = new_session("u2netp")
-        print("[startup] rembg session loaded.", file=sys.stderr, flush=True)
-    return _session
+def get_ort_session():
+    global _ort_session
+    if _ort_session is None:
+        if not os.path.exists(MODEL_PATH):
+            print("[startup] downloading u2netp model...", file=sys.stderr, flush=True)
+            resp = requests.get(MODEL_URL, timeout=120)
+            resp.raise_for_status()
+            with open(MODEL_PATH, "wb") as f:
+                f.write(resp.content)
+            print("[startup] model downloaded.", file=sys.stderr, flush=True)
+        print("[startup] loading onnxruntime session...", file=sys.stderr, flush=True)
+        _ort_session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+        print("[startup] onnxruntime session ready.", file=sys.stderr, flush=True)
+    return _ort_session
+
+
+def remove_background(img_rgb):
+    """Take a PIL RGB image, return an RGBA PIL image with background removed."""
+    session = get_ort_session()
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+
+    orig_w, orig_h = img_rgb.size
+    small = img_rgb.resize((320, 320), Image.Resampling.LANCZOS)
+    arr = np.asarray(small).astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    arr = (arr - mean) / std
+    arr = arr.transpose(2, 0, 1)[np.newaxis, ...].astype(np.float32)
+
+    outputs = session.run([output_name], {input_name: arr})
+    mask = np.squeeze(outputs[0])
+    if mask.ndim == 3:
+        mask = mask[0]
+
+    mask = mask - mask.min()
+    denom = mask.max()
+    if denom > 0:
+        mask = mask / denom
+    mask = (mask * 255).astype(np.uint8)
+
+    mask_img = Image.fromarray(mask, mode="L").resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+
+    rgba = img_rgb.convert("RGBA")
+    rgba.putalpha(mask_img)
+    return rgba
 
 MAX_PHOTOS = 50
 OUTPUT_SIZE = 700
@@ -381,7 +427,7 @@ def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_p
 
     target_h = size * scale_pct
     target_w = target_h * (cutout_rgba.width / cutout_rgba.height)
-    subject = cutout_rgba.resize((int(target_w), int(target_h)), Image.LANCZOS)
+    subject = cutout_rgba.resize((int(target_w), int(target_h)), Image.Resampling.LANCZOS)
 
     dx = int((size - target_w) / 2)
     dy = int(size - target_h - size * 0.02)
@@ -396,7 +442,7 @@ def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_p
     result = result.convert("RGB")
 
     if hd:
-        result = result.resize((size * HD_SCALE, size * HD_SCALE), Image.LANCZOS)
+        result = result.resize((int(size * HD_SCALE), int(size * HD_SCALE)), Image.Resampling.LANCZOS)
         result = result.filter(ImageFilter.UnsharpMask(radius=2, percent=120, threshold=2))
 
     return result
@@ -434,8 +480,8 @@ def process():
         print(f"[process] photo {idx}/{len(photos)}: {photo.filename}", file=sys.stderr, flush=True)
         try:
             raw = photo.read()
-            cutout = remove(raw, session=get_session())  # bytes -> bytes (RGBA PNG), via rembg
-            cutout_img = Image.open(io.BytesIO(cutout)).convert("RGBA")
+            input_img = Image.open(io.BytesIO(raw)).convert("RGB")
+            cutout_img = remove_background(input_img)
             final_img = compose_on_background(
                 cutout_img, bg_mode, bg_image_bytes, feather, scale_pct, hd
             )
@@ -443,7 +489,7 @@ def process():
             final_img.save(buf, format="PNG")
             buf.seek(0)
             results.append(buf)
-            del raw, cutout, cutout_img, final_img
+            del raw, input_img, cutout_img, final_img
         except Exception as e:
             err_text = f"{photo.filename}: {type(e).__name__}: {e}"
             errors.append(err_text)
