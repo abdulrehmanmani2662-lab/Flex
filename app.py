@@ -11,6 +11,7 @@ Everything (backend + frontend) lives in this one file on purpose,
 so the whole project is just this folder: app.py + requirements.txt.
 """
 
+import gc
 import io
 import os
 import zipfile
@@ -41,6 +42,7 @@ PAGE = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Batch Background Remover</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
 :root{--ink:#0f1a12;--paper:#f4f7f2;--green-deep:#12331f;--green:#1f6b3a;
 --green-bright:#3fae5c;--gold:#d9a441;--line:#c9d6c6;--card:#ffffff;}
@@ -133,6 +135,9 @@ footer{text-align:center;color:#9fb8a4;font-size:12px;padding:20px;}
   <div class="card wide">
     <h2><span class="badge">3</span> Process &amp; Download</h2>
     <button class="btn primary" id="processBtn" disabled>Sab Photos Process Karein</button>
+    <div class="progress-bar" id="progressBar" style="display:none;height:8px;background:#e6ede6;border-radius:6px;overflow:hidden;margin-bottom:10px;">
+      <div id="progressFill" style="height:100%;width:0%;background:var(--green-bright);transition:width .2s;"></div>
+    </div>
     <div class="status" id="status"></div>
     <div class="gallery" id="gallery"></div>
   </div>
@@ -209,37 +214,94 @@ bgInput.addEventListener('change', e=>{
   bgUploadSwatch.classList.add('selected');
 });
 
-processBtn.addEventListener('click', async ()=>{
-  if(files.length === 0) return;
-  processBtn.disabled = true;
-  setStatus(`${files.length} photos process ho rahi hain... (thoda time lagega)`, true);
+// Photos ko chhote batches me bhejte hain taake ek request bhaari hokar
+// server par timeout/crash (502) na ho. Har batch ka result (PNG ya ZIP)
+// browser me hi ek final ZIP me jama hota hai.
+const CHUNK_SIZE = 4;
+const progressBar = document.getElementById('progressBar');
+const progressFill = document.getElementById('progressFill');
 
+function chunkArray(arr, size){
+  const out = [];
+  for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size));
+  return out;
+}
+
+async function processChunk(chunkFiles){
   const form = new FormData();
-  files.forEach(f => form.append('photos', f));
+  chunkFiles.forEach(f => form.append('photos', f));
   form.append('bg_mode', bgMode);
   if(bgFile) form.append('bg_image', bgFile);
   form.append('feather', featherRange.value);
   form.append('scale', scaleRange.value);
   form.append('hd', hdToggle.checked ? '1' : '0');
 
-  try{
-    const res = await fetch('/process', { method:'POST', body: form });
-    if(!res.ok) throw new Error('Server error: ' + res.status);
-    const blob = await res.blob();
-    const cd = res.headers.get('Content-Disposition') || '';
-    const nameMatch = cd.match(/filename="?([^"]+)"?/);
-    const filename = nameMatch ? nameMatch[1] : 'result.png';
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = filename;
-    link.click();
-    setStatus('Mukammal ✅ — download shuru ho gaya.');
-  }catch(err){
-    console.error(err);
-    setStatus('Kuch masla hua: ' + err.message);
-  }finally{
-    processBtn.disabled = false;
+  const res = await fetch('/process', { method:'POST', body: form });
+  if(!res.ok) throw new Error(`Batch failed (status ${res.status})`);
+  const blob = await res.blob();
+  const contentType = res.headers.get('Content-Type') || '';
+  return { blob, isZip: contentType.includes('zip') };
+}
+
+processBtn.addEventListener('click', async ()=>{
+  if(files.length === 0) return;
+  processBtn.disabled = true;
+  progressBar.style.display = 'block';
+  progressFill.style.width = '0%';
+
+  const chunks = chunkArray(files, CHUNK_SIZE);
+  const finalZip = new JSZip();
+  let photoCounter = 0;
+  let failedCount = 0;
+  let singlePngBlob = null;
+
+  for(let i=0; i<chunks.length; i++){
+    setStatus(`Batch ${i+1} / ${chunks.length} process ho raha hai... (${photoCounter}/${files.length} mukammal)`, true);
+    try{
+      const { blob, isZip } = await processChunk(chunks[i]);
+      if(isZip){
+        const loaded = await JSZip.loadAsync(blob);
+        const entries = Object.values(loaded.files);
+        for(const entry of entries){
+          const content = await entry.async('blob');
+          photoCounter++;
+          finalZip.file(`photo-${String(photoCounter).padStart(3,'0')}.png`, content);
+        }
+      } else {
+        photoCounter++;
+        singlePngBlob = blob;
+        finalZip.file(`photo-${String(photoCounter).padStart(3,'0')}.png`, blob);
+      }
+    }catch(err){
+      console.error(err);
+      failedCount += chunks[i].length;
+    }
+    progressFill.style.width = `${Math.round(((i+1)/chunks.length)*100)}%`;
   }
+
+  if(photoCounter === 0){
+    setStatus('Kuch masla hua — koi photo process nahi ho saki. Dobara koshish karein.');
+    processBtn.disabled = false;
+    return;
+  }
+
+  if(photoCounter === 1 && singlePngBlob){
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(singlePngBlob);
+    link.download = 'blended-photo.png';
+    link.click();
+  } else {
+    setStatus('ZIP taiyar ho raha hai...', true);
+    const zipBlob = await finalZip.generateAsync({ type:'blob' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(zipBlob);
+    link.download = 'blended-photos.zip';
+    link.click();
+  }
+
+  const failMsg = failedCount > 0 ? ` (${failedCount} photos fail ho gayin)` : '';
+  setStatus(`Mukammal ✅ — ${photoCounter} photos download ho gayin${failMsg}.`);
+  processBtn.disabled = false;
 });
 </script>
 </body>
@@ -354,6 +416,9 @@ def process():
         final_img.save(buf, format="PNG")
         buf.seek(0)
         results.append(buf)
+
+        del raw, cutout, cutout_img, final_img
+        gc.collect()
 
     if len(results) == 1:
         return send_file(
