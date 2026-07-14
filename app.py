@@ -14,6 +14,8 @@ so the whole project is just this folder: app.py + requirements.txt.
 import gc
 import io
 import os
+import sys
+import traceback
 import zipfile
 
 from flask import Flask, request, render_template_string, send_file
@@ -28,8 +30,8 @@ app = Flask(__name__)
 _session = new_session("u2netp")
 
 MAX_PHOTOS = 50
-OUTPUT_SIZE = 1000
-HD_SCALE = 2
+OUTPUT_SIZE = 700
+HD_SCALE = 1.5
 
 # ---------------------------------------------------------------------------
 # Frontend (HTML + CSS + JS embedded as a single template string)
@@ -129,7 +131,7 @@ footer{text-align:center;color:#9fb8a4;font-size:12px;padding:20px;}
     </div>
     <div class="row"><label>Edge Blend</label><input type="range" id="featherRange" min="0" max="20" value="6"></div>
     <div class="row"><label>Photo Size</label><input type="range" id="scaleRange" min="40" max="150" value="90"></div>
-    <div class="row checkbox-row"><label>HD Enhance</label><input type="checkbox" id="hdToggle" checked></div>
+    <div class="row checkbox-row"><label>HD Enhance</label><input type="checkbox" id="hdToggle"></div>
   </div>
 
   <div class="card wide">
@@ -405,20 +407,28 @@ def process():
         bg_image_bytes = bg_file.read()
 
     results = []
-    for photo in photos:
-        raw = photo.read()
-        cutout = remove(raw, session=_session)  # bytes in -> bytes out (RGBA PNG), via rembg
-        cutout_img = Image.open(io.BytesIO(cutout)).convert("RGBA")
-        final_img = compose_on_background(
-            cutout_img, bg_mode, bg_image_bytes, feather, scale_pct, hd
-        )
-        buf = io.BytesIO()
-        final_img.save(buf, format="PNG")
-        buf.seek(0)
-        results.append(buf)
+    for idx, photo in enumerate(photos, start=1):
+        print(f"[process] photo {idx}/{len(photos)}: {photo.filename}", file=sys.stderr, flush=True)
+        try:
+            raw = photo.read()
+            cutout = remove(raw, session=_session)  # bytes -> bytes (RGBA PNG), via rembg
+            cutout_img = Image.open(io.BytesIO(cutout)).convert("RGBA")
+            final_img = compose_on_background(
+                cutout_img, bg_mode, bg_image_bytes, feather, scale_pct, hd
+            )
+            buf = io.BytesIO()
+            final_img.save(buf, format="PNG")
+            buf.seek(0)
+            results.append(buf)
+            del raw, cutout, cutout_img, final_img
+        except Exception:
+            print(f"[process] FAILED on {photo.filename}:", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            gc.collect()
 
-        del raw, cutout, cutout_img, final_img
-        gc.collect()
+    if not results:
+        return {"error": "All photos failed to process — check server logs"}, 500
 
     if len(results) == 1:
         return send_file(
