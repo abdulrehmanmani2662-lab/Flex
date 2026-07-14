@@ -27,7 +27,19 @@ app = Flask(__name__)
 
 # u2netp is the "lite" rembg model (~4MB vs ~170MB for the default u2net) —
 # uses far less RAM, which matters on free-tier hosting (512MB limit).
-_session = new_session("u2netp")
+# Loaded lazily (on first request, not at import time) so that if model
+# download/load fails, we get a clear error in the response instead of
+# the whole app crashing silently before it can even start serving.
+_session = None
+
+
+def get_session():
+    global _session
+    if _session is None:
+        print("[startup] loading rembg session (u2netp)...", file=sys.stderr, flush=True)
+        _session = new_session("u2netp")
+        print("[startup] rembg session loaded.", file=sys.stderr, flush=True)
+    return _session
 
 MAX_PHOTOS = 50
 OUTPUT_SIZE = 700
@@ -239,7 +251,15 @@ async function processChunk(chunkFiles){
   form.append('hd', hdToggle.checked ? '1' : '0');
 
   const res = await fetch('/process', { method:'POST', body: form });
-  if(!res.ok) throw new Error(`Batch failed (status ${res.status})`);
+  if(!res.ok){
+    let detail = `status ${res.status}`;
+    try{
+      const j = await res.clone().json();
+      if(j.details && j.details.length) detail = j.details.join(' | ');
+      else if(j.error) detail = j.error;
+    }catch(e){ /* response wasn't JSON, keep generic status */ }
+    throw new Error(detail);
+  }
   const blob = await res.blob();
   const contentType = res.headers.get('Content-Type') || '';
   return { blob, isZip: contentType.includes('zip') };
@@ -256,6 +276,7 @@ processBtn.addEventListener('click', async ()=>{
   let photoCounter = 0;
   let failedCount = 0;
   let singlePngBlob = null;
+  let lastError = '';
 
   for(let i=0; i<chunks.length; i++){
     setStatus(`Batch ${i+1} / ${chunks.length} process ho raha hai... (${photoCounter}/${files.length} mukammal)`, true);
@@ -276,13 +297,14 @@ processBtn.addEventListener('click', async ()=>{
       }
     }catch(err){
       console.error(err);
+      lastError = err.message;
       failedCount += chunks[i].length;
     }
     progressFill.style.width = `${Math.round(((i+1)/chunks.length)*100)}%`;
   }
 
   if(photoCounter === 0){
-    setStatus('Kuch masla hua — koi photo process nahi ho saki. Dobara koshish karein.');
+    setStatus(`Masla: ${lastError || 'Wajah nahi mili, dobara koshish karein.'}`);
     processBtn.disabled = false;
     return;
   }
@@ -407,11 +429,12 @@ def process():
         bg_image_bytes = bg_file.read()
 
     results = []
+    errors = []
     for idx, photo in enumerate(photos, start=1):
         print(f"[process] photo {idx}/{len(photos)}: {photo.filename}", file=sys.stderr, flush=True)
         try:
             raw = photo.read()
-            cutout = remove(raw, session=_session)  # bytes -> bytes (RGBA PNG), via rembg
+            cutout = remove(raw, session=get_session())  # bytes -> bytes (RGBA PNG), via rembg
             cutout_img = Image.open(io.BytesIO(cutout)).convert("RGBA")
             final_img = compose_on_background(
                 cutout_img, bg_mode, bg_image_bytes, feather, scale_pct, hd
@@ -421,14 +444,16 @@ def process():
             buf.seek(0)
             results.append(buf)
             del raw, cutout, cutout_img, final_img
-        except Exception:
-            print(f"[process] FAILED on {photo.filename}:", file=sys.stderr, flush=True)
+        except Exception as e:
+            err_text = f"{photo.filename}: {type(e).__name__}: {e}"
+            errors.append(err_text)
+            print(f"[process] FAILED on {err_text}", file=sys.stderr, flush=True)
             traceback.print_exc(file=sys.stderr)
         finally:
             gc.collect()
 
     if not results:
-        return {"error": "All photos failed to process — check server logs"}, 500
+        return {"error": "All photos failed to process", "details": errors}, 500
 
     if len(results) == 1:
         return send_file(
