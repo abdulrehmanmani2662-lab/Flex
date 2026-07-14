@@ -12,14 +12,19 @@ so the whole project is just this folder: app.py + requirements.txt.
 """
 
 import io
+import os
 import zipfile
 
 from flask import Flask, request, render_template_string, send_file
 from PIL import Image, ImageFilter, ImageDraw
 
-from rembg import remove
+from rembg import new_session, remove
 
 app = Flask(__name__)
+
+# u2netp is the "lite" rembg model (~4MB vs ~170MB for the default u2net) —
+# uses far less RAM, which matters on free-tier hosting (512MB limit).
+_session = new_session("u2netp")
 
 MAX_PHOTOS = 50
 OUTPUT_SIZE = 1000
@@ -340,7 +345,7 @@ def process():
     results = []
     for photo in photos:
         raw = photo.read()
-        cutout = remove(raw)  # bytes in -> bytes out (RGBA PNG), via rembg
+        cutout = remove(raw, session=_session)  # bytes in -> bytes out (RGBA PNG), via rembg
         cutout_img = Image.open(io.BytesIO(cutout)).convert("RGBA")
         final_img = compose_on_background(
             cutout_img, bg_mode, bg_image_bytes, feather, scale_pct, hd
@@ -373,4 +378,5 @@ def process():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
