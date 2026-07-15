@@ -197,7 +197,8 @@ footer{text-align:center;color:#9fb8a4;font-size:12px;padding:20px;}
   <div class="card">
     <h2><span class="badge">2</span> Background Chunein</h2>
     <div class="bg-options" id="bgOptions">
-      <div class="swatch selected" data-bg="green-poster" style="background:linear-gradient(135deg,#3fae5c,#0a1f13)"></div>
+      <div class="swatch selected" data-bg="transparent" title="Background nahi, sirf cutout" style="background-image:linear-gradient(45deg,#ccc 25%,transparent 25%),linear-gradient(-45deg,#ccc 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ccc 75%),linear-gradient(-45deg,transparent 75%,#ccc 75%);background-size:12px 12px;background-position:0 0,0 6px,6px -6px,-6px 0px;background-color:#fff;"></div>
+      <div class="swatch" data-bg="green-poster" style="background:linear-gradient(135deg,#3fae5c,#0a1f13)"></div>
       <div class="swatch" data-bg="#0a1f13" style="background:#0a1f13"></div>
       <div class="swatch" data-bg="#ffffff" style="background:#ffffff"></div>
       <div class="swatch" data-bg="#0b1e3d" style="background:#0b1e3d"></div>
@@ -240,7 +241,7 @@ const statusEl = document.getElementById('status');
 const gallery = document.getElementById('gallery');
 
 let files = [];
-let bgMode = 'green-poster';
+let bgMode = 'transparent';
 let bgFile = null;
 
 function setStatus(msg, spinning=false){
@@ -439,21 +440,57 @@ def paint_background(size, bg_mode, bg_image_bytes):
     return Image.new("RGBA", (w, h), color)
 
 
+def crop_to_subject(cutout_rgba, padding_ratio=0.08):
+    """Tight-crop an RGBA cutout to its non-transparent bounding box, with a
+    small padding margin, instead of leaving it centered on a big square."""
+    alpha = np.array(cutout_rgba.split()[-1])
+    ys, xs = np.where(alpha > 10)
+    if len(xs) == 0 or len(ys) == 0:
+        return cutout_rgba  # nothing detected, return unchanged
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    w, h = x1 - x0, y1 - y0
+    pad_x, pad_y = int(w * padding_ratio), int(h * padding_ratio)
+    x0 = max(0, x0 - pad_x)
+    y0 = max(0, y0 - pad_y)
+    x1 = min(cutout_rgba.width, x1 + pad_x)
+    y1 = min(cutout_rgba.height, y1 + pad_y)
+    return cutout_rgba.crop((x0, y0, x1, y1))
+
+
 def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_pct, hd):
+    if feather > 0:
+        alpha = cutout_rgba.split()[-1]
+        alpha = alpha.filter(ImageFilter.GaussianBlur(feather))
+        cutout_rgba.putalpha(alpha)
+
+    cropped = crop_to_subject(cutout_rgba)
+
+    if bg_mode == "transparent":
+        # No background painted — khud transparent PNG, tight-cropped around
+        # the subject. Koi background select karne ki zaroorat nahi.
+        result = cropped
+        if hd:
+            new_w = int(result.width * HD_SCALE)
+            new_h = int(result.height * HD_SCALE)
+            result = result.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            r, g, b, a = result.split()
+            rgb = Image.merge("RGB", (r, g, b)).filter(
+                ImageFilter.UnsharpMask(radius=2, percent=120, threshold=2)
+            )
+            r2, g2, b2 = rgb.split()
+            result = Image.merge("RGBA", (r2, g2, b2, a))
+        return result
+
     size = OUTPUT_SIZE
     background = paint_background(size, bg_mode, bg_image_bytes)
 
     target_h = size * scale_pct
-    target_w = target_h * (cutout_rgba.width / cutout_rgba.height)
-    subject = cutout_rgba.resize((int(target_w), int(target_h)), Image.Resampling.LANCZOS)
+    target_w = target_h * (cropped.width / cropped.height)
+    subject = cropped.resize((int(target_w), int(target_h)), Image.Resampling.LANCZOS)
 
     dx = int((size - target_w) / 2)
     dy = int(size - target_h - size * 0.02)
-
-    if feather > 0:
-        alpha = subject.split()[-1]
-        alpha = alpha.filter(ImageFilter.GaussianBlur(feather))
-        subject.putalpha(alpha)
 
     result = background.copy()
     result.alpha_composite(subject, (dx, dy))
