@@ -247,6 +247,7 @@ footer{text-align:center;color:#9fb8a4;font-size:12px;padding:20px;}
     <div class="row"><label>Edge Blend</label><input type="range" id="featherRange" min="0" max="20" value="2"></div>
     <div class="row"><label>Photo Size</label><input type="range" id="scaleRange" min="40" max="150" value="90"></div>
     <div class="row checkbox-row"><label>HD Enhance</label><input type="checkbox" id="hdToggle"></div>
+    <div class="row checkbox-row"><label>Bottom Fade (background mein blend)</label><input type="checkbox" id="fadeToggle" checked></div>
   </div>
 
   <div class="card wide">
@@ -274,6 +275,7 @@ const bgInput = document.getElementById('bgInput');
 const featherRange = document.getElementById('featherRange');
 const scaleRange = document.getElementById('scaleRange');
 const hdToggle = document.getElementById('hdToggle');
+const fadeToggle = document.getElementById('fadeToggle');
 const processBtn = document.getElementById('processBtn');
 const statusEl = document.getElementById('status');
 const gallery = document.getElementById('gallery');
@@ -352,6 +354,7 @@ async function processChunk(chunkFiles){
   form.append('feather', featherRange.value);
   form.append('scale', scaleRange.value);
   form.append('hd', hdToggle.checked ? '1' : '0');
+  form.append('fade_bottom', fadeToggle.checked ? '1' : '0');
 
   const res = await fetch('/process', { method:'POST', body: form });
   if(!res.ok){
@@ -478,6 +481,22 @@ def paint_background(size, bg_mode, bg_image_bytes):
     return Image.new("RGBA", (w, h), color)
 
 
+def fade_bottom_edge(rgba_img, fade_ratio=0.22):
+    """Gradually fade alpha to 0 over the bottom portion of the image so the
+    subject blends into whatever background it's placed on, instead of a
+    hard rectangular cutoff at the bottom."""
+    w, h = rgba_img.size
+    fade_h = int(h * fade_ratio)
+    if fade_h <= 0:
+        return rgba_img
+    arr = np.array(rgba_img).astype(np.float32)
+    grad = np.ones(h, dtype=np.float32)
+    grad[h - fade_h:] = np.linspace(1.0, 0.0, fade_h)
+    grad = grad[:, None]
+    arr[..., 3] = arr[..., 3] * grad
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGBA")
+
+
 def crop_to_subject(cutout_rgba, padding_ratio=0.08):
     """Tight-crop an RGBA cutout to its non-transparent bounding box, with a
     small padding margin, instead of leaving it centered on a big square."""
@@ -496,13 +515,15 @@ def crop_to_subject(cutout_rgba, padding_ratio=0.08):
     return cutout_rgba.crop((x0, y0, x1, y1))
 
 
-def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_pct, hd):
+def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_pct, hd, fade_bottom=True):
     if feather > 0:
         alpha = cutout_rgba.split()[-1]
         alpha = alpha.filter(ImageFilter.GaussianBlur(feather))
         cutout_rgba.putalpha(alpha)
 
     cropped = crop_to_subject(cutout_rgba)
+    if fade_bottom:
+        cropped = fade_bottom_edge(cropped)
 
     if bg_mode == "transparent":
         # No background painted — khud transparent PNG, tight-cropped around
@@ -561,6 +582,7 @@ def process():
     feather = int(request.form.get("feather", 6))
     scale_pct = int(request.form.get("scale", 90)) / 100
     hd = request.form.get("hd", "1") == "1"
+    fade_bottom = request.form.get("fade_bottom", "1") == "1"
 
     bg_image_bytes = None
     bg_file = request.files.get("bg_image")
@@ -576,7 +598,7 @@ def process():
             input_img = Image.open(io.BytesIO(raw)).convert("RGB")
             cutout_img = remove_background(input_img)
             final_img = compose_on_background(
-                cutout_img, bg_mode, bg_image_bytes, feather, scale_pct, hd
+                cutout_img, bg_mode, bg_image_bytes, feather, scale_pct, hd, fade_bottom
             )
             buf = io.BytesIO()
             final_img.save(buf, format="PNG")
