@@ -138,9 +138,6 @@ def remove_background(img_rgb):
     rgba = img_rgb.convert("RGBA")
     rgba.putalpha(clean_mask_img)
 
-    bg_color = estimate_background_color(img_rgb, mask_arr)
-    rgba = decontaminate_edges(rgba, bg_color)
-
     return rgba
 
 MAX_PHOTOS = 50
@@ -512,6 +509,16 @@ def trim_faint_alpha(rgba_img, threshold=20):
     return rgba_img.crop((x0, y0, x1 + 1, y1 + 1))
 
 
+def clamp_low_alpha(rgba_img, threshold=35):
+    """Snap faint/near-transparent alpha values to fully transparent
+    everywhere (all sides, not just bottom) so no leftover halo/shadow
+    shows around the subject when placed on a background."""
+    arr = np.array(rgba_img)
+    alpha = arr[..., 3]
+    arr[..., 3] = np.where(alpha < threshold, 0, alpha)
+    return Image.fromarray(arr, mode="RGBA")
+
+
 def crop_to_subject(cutout_rgba, padding_ratio=0.08):
     """Tight-crop an RGBA cutout to its non-transparent bounding box, with a
     small padding margin, instead of leaving it centered on a big square."""
@@ -537,6 +544,7 @@ def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_p
         cutout_rgba.putalpha(alpha)
 
     cropped = crop_to_subject(cutout_rgba)
+    cropped = clamp_low_alpha(cropped)
     if fade_bottom:
         cropped = fade_bottom_edge(cropped, fade_ratio=0.15)
         cropped = trim_faint_alpha(cropped, threshold=20)
@@ -555,6 +563,7 @@ def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_p
             )
             r2, g2, b2 = rgb.split()
             result = Image.merge("RGBA", (r2, g2, b2, a))
+            result = clamp_low_alpha(result, threshold=20)
         return result
 
     size = OUTPUT_SIZE
