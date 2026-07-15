@@ -74,6 +74,31 @@ def get_ort_session():
     return _ort_session
 
 
+def estimate_background_color(img_rgb, soft_mask_arr):
+    """Median color of pixels the model is confident are background —
+    used to strip that color out of semi-transparent edge pixels."""
+    arr = np.asarray(img_rgb).astype(np.float32)
+    bg_pixels = arr[soft_mask_arr < 10]
+    if len(bg_pixels) < 50:
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    return np.median(bg_pixels, axis=0)
+
+
+def decontaminate_edges(rgba_img, bg_color):
+    """Remove background-color bleed from semi-transparent edge pixels so
+    no colored halo/glow shows when the cutout is placed on a new background."""
+    arr = np.asarray(rgba_img).astype(np.float32)
+    rgb = arr[..., :3]
+    a = arr[..., 3:4] / 255.0
+    edge_mask = (a > 0.02) & (a < 0.98)
+    a_safe = np.clip(a, 0.08, 1.0)
+    decontam = (rgb - (1 - a_safe) * bg_color) / a_safe
+    decontam = np.clip(decontam, 0, 255)
+    rgb_out = np.where(edge_mask, decontam, rgb)
+    out = np.concatenate([rgb_out, arr[..., 3:4]], axis=-1).astype(np.uint8)
+    return Image.fromarray(out, mode="RGBA")
+
+
 def remove_background(img_rgb):
     """Take a PIL RGB image, return an RGBA PIL image with background removed."""
     session = get_ort_session()
@@ -100,9 +125,22 @@ def remove_background(img_rgb):
     mask = (mask * 255).astype(np.uint8)
 
     mask_img = Image.fromarray(mask, mode="L").resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+    mask_arr = np.array(mask_img)
+
+    # u2netp ka mask fuzzy/low-res hota hai — isko "hard" bana ke thoda
+    # andar se erode karte hain taake purani background ka rim/glow na bache,
+    # phir sirf halka sa blur anti-aliasing ke liye.
+    binary = (mask_arr > 130).astype(np.uint8) * 255
+    clean_mask_img = Image.fromarray(binary, mode="L")
+    clean_mask_img = clean_mask_img.filter(ImageFilter.MinFilter(5))   # ~2px erode
+    clean_mask_img = clean_mask_img.filter(ImageFilter.GaussianBlur(1.5))  # gentle anti-alias
 
     rgba = img_rgb.convert("RGBA")
-    rgba.putalpha(mask_img)
+    rgba.putalpha(clean_mask_img)
+
+    bg_color = estimate_background_color(img_rgb, mask_arr)
+    rgba = decontaminate_edges(rgba, bg_color)
+
     return rgba
 
 MAX_PHOTOS = 50
@@ -206,7 +244,7 @@ footer{text-align:center;color:#9fb8a4;font-size:12px;padding:20px;}
       <div class="swatch upload-swatch" id="bgUploadSwatch">+</div>
       <input type="file" id="bgInput" accept="image/*" hidden>
     </div>
-    <div class="row"><label>Edge Blend</label><input type="range" id="featherRange" min="0" max="20" value="6"></div>
+    <div class="row"><label>Edge Blend</label><input type="range" id="featherRange" min="0" max="20" value="2"></div>
     <div class="row"><label>Photo Size</label><input type="range" id="scaleRange" min="40" max="150" value="90"></div>
     <div class="row checkbox-row"><label>HD Enhance</label><input type="checkbox" id="hdToggle"></div>
   </div>
