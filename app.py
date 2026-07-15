@@ -90,8 +90,8 @@ def decontaminate_edges(rgba_img, bg_color):
     arr = np.asarray(rgba_img).astype(np.float32)
     rgb = arr[..., :3]
     a = arr[..., 3:4] / 255.0
-    edge_mask = (a > 0.02) & (a < 0.98)
-    a_safe = np.clip(a, 0.08, 1.0)
+    edge_mask = (a > 0.01) & (a < 0.99)
+    a_safe = np.clip(a, 0.15, 1.0)
     decontam = (rgb - (1 - a_safe) * bg_color) / a_safe
     decontam = np.clip(decontam, 0, 255)
     rgb_out = np.where(edge_mask, decontam, rgb)
@@ -127,13 +127,13 @@ def remove_background(img_rgb):
     mask_img = Image.fromarray(mask, mode="L").resize((orig_w, orig_h), Image.Resampling.LANCZOS)
     mask_arr = np.array(mask_img)
 
-    # u2netp ka mask fuzzy/low-res hota hai — isko "hard" bana ke thoda
-    # andar se erode karte hain taake purani background ka rim/glow na bache,
-    # phir sirf halka sa blur anti-aliasing ke liye.
-    binary = (mask_arr > 130).astype(np.uint8) * 255
+    # u2netp ka mask fuzzy/low-res hota hai — isko "hard" bana ke zyada
+    # andar se erode karte hain taake purani background ka rim/glow poori
+    # tarah kat jaye, phir sirf halka sa blur anti-aliasing ke liye.
+    binary = (mask_arr > 150).astype(np.uint8) * 255
     clean_mask_img = Image.fromarray(binary, mode="L")
-    clean_mask_img = clean_mask_img.filter(ImageFilter.MinFilter(5))   # ~2px erode
-    clean_mask_img = clean_mask_img.filter(ImageFilter.GaussianBlur(1.5))  # gentle anti-alias
+    clean_mask_img = clean_mask_img.filter(ImageFilter.MinFilter(7))   # ~3px erode
+    clean_mask_img = clean_mask_img.filter(ImageFilter.GaussianBlur(1.2))  # gentle anti-alias
 
     rgba = img_rgb.convert("RGBA")
     rgba.putalpha(clean_mask_img)
@@ -497,6 +497,21 @@ def fade_bottom_edge(rgba_img, fade_ratio=0.22):
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGBA")
 
 
+def trim_faint_alpha(rgba_img, threshold=20):
+    """After fading, drop rows/cols that are almost fully transparent so the
+    crop box stays tight — only a short visible fade band remains, not a
+    big empty transparent area."""
+    arr = np.array(rgba_img)
+    alpha = arr[..., 3]
+    rows = np.where(alpha.max(axis=1) > threshold)[0]
+    cols = np.where(alpha.max(axis=0) > threshold)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return rgba_img
+    y0, y1 = int(rows.min()), int(rows.max())
+    x0, x1 = int(cols.min()), int(cols.max())
+    return rgba_img.crop((x0, y0, x1 + 1, y1 + 1))
+
+
 def crop_to_subject(cutout_rgba, padding_ratio=0.08):
     """Tight-crop an RGBA cutout to its non-transparent bounding box, with a
     small padding margin, instead of leaving it centered on a big square."""
@@ -523,7 +538,8 @@ def compose_on_background(cutout_rgba, bg_mode, bg_image_bytes, feather, scale_p
 
     cropped = crop_to_subject(cutout_rgba)
     if fade_bottom:
-        cropped = fade_bottom_edge(cropped)
+        cropped = fade_bottom_edge(cropped, fade_ratio=0.15)
+        cropped = trim_faint_alpha(cropped, threshold=20)
 
     if bg_mode == "transparent":
         # No background painted — khud transparent PNG, tight-cropped around
